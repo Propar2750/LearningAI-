@@ -1,29 +1,25 @@
-export type EdgeType = 'subtopic' | 'prerequisite' | 'see-also' | 'side-question';
+export type NodeKind = 'trunk' | 'side' | 'prereq';
 
-export interface GraphNode {
+export interface Turn {
+  user: string;
+  assistant: string;
+}
+
+export interface GNode {
   id: string;
-  prompt: string;
-  reply: string;
-  summary: string;
-  parentIds: string[];
-  createdAt: number;
-  isTrunk: boolean;
+  label: string;
+  kind: NodeKind;
+  turn: Turn;
 }
 
-export interface GraphEdge {
-  from: string;
-  to: string;
-  type: EdgeType;
-}
-
-export interface Goal {
-  text: string;
+export interface GLink {
+  source: string;
+  target: string;
 }
 
 export interface Graph {
-  goal: Goal;
-  nodes: GraphNode[];
-  edges: GraphEdge[];
+  nodes: GNode[];
+  links: GLink[];
 }
 
-export type ViewMode = 'chat' | 'graph';
+export type ViewMode = 'graph' | 'chat';

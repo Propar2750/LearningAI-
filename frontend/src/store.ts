@@ -1,50 +1,25 @@
 import { create } from 'zustand';
-import type { Graph, ViewMode } from './types';
+import { Graph, ViewMode } from './types';
 import { mockGraph } from './mock/graph';
-import * as api from './api/client';
-import { recompute, type Position } from './graph/layout';
 
 interface State {
-  graph: Graph;
-  positions: Map<string, Position>;
   mode: ViewMode;
-  focusedNodeId: string | null;
-  highlightedNodeId: string | null;
+  selectedNodeId: string | null;
+  graph: Graph;
   setMode: (m: ViewMode) => void;
-  focusNode: (id: string | null) => void;
-  highlightNode: (id: string | null) => void;
-  submitPrompt: (prompt: string) => Promise<void>;
-  loadGraph: () => Promise<void>;
+  toggleMode: () => void;
+  selectNode: (id: string) => void;
+  clearSelection: () => void;
 }
 
-const initialPositions = recompute(mockGraph, new Map());
-
-export const useStore = create<State>((set, get) => ({
-  graph: mockGraph,
-  positions: initialPositions,
-  mode: 'chat',
-  focusedNodeId: null,
-  highlightedNodeId: null,
-
+// Seeded synchronously from mockGraph so first render has data.
+// Replace with `await getGraph()` once a real backend exists.
+export const useStore = create<State>((set) => ({
+  mode: 'graph',
+  selectedNodeId: null,
+  graph: JSON.parse(JSON.stringify(mockGraph)),
   setMode: (mode) => set({ mode }),
-  focusNode: (focusedNodeId) => set({ focusedNodeId, highlightedNodeId: null }),
-  highlightNode: (highlightedNodeId) => set({ highlightedNodeId }),
-
-  loadGraph: async () => {
-    const graph = await api.getGraph();
-    set({ graph, positions: recompute(graph, get().positions) });
-  },
-
-  submitPrompt: async (prompt) => {
-    const { focusedNodeId, mode } = get();
-    await api.postPrompt({ prompt, focusedNodeId });
-    const graph = await api.getGraph();
-    const positions = recompute(graph, get().positions);
-    const latest = graph.nodes[graph.nodes.length - 1];
-    set({
-      graph,
-      positions,
-      focusedNodeId: mode === 'chat' ? latest.id : focusedNodeId,
-    });
-  },
+  toggleMode: () => set((s) => ({ mode: s.mode === 'graph' ? 'chat' : 'graph' })),
+  selectNode: (id) => set({ selectedNodeId: id, mode: 'chat' }),
+  clearSelection: () => set({ selectedNodeId: null }),
 }));
