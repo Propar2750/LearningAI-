@@ -8,3 +8,8 @@ build/
 __pycache__/
 *.pyc
 .vite/
+
+# Claude Code / agent skill tooling
+.claude/
+.agents/
+skills-lock.json
