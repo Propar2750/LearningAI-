@@ -1,19 +1,26 @@
 import { Graph, GNode } from '../types';
-import { mockGraph } from '../mock/graph';
+import { supabase } from '../lib/supabase';
 
-// Deep clone so callers can't mutate the source of truth.
-function clone<T>(x: T): T {
-  return JSON.parse(JSON.stringify(x));
+const BASE_URL = import.meta.env.VITE_API_BASE_URL;
+
+async function authedFetch<T>(path: string): Promise<T> {
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  if (!token) throw new Error('not authenticated');
+
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    throw new Error(`${path} failed: ${res.status} ${res.statusText}`);
+  }
+  return res.json() as Promise<T>;
 }
 
-let state: Graph = clone(mockGraph);
-
-export async function getGraph(): Promise<Graph> {
-  return clone(state);
+export function getGraph(): Promise<Graph> {
+  return authedFetch<Graph>('/api/graph');
 }
 
-export async function selectNode(id: string): Promise<GNode> {
-  const n = state.nodes.find(n => n.id === id);
-  if (!n) throw new Error(`unknown node: ${id}`);
-  return clone(n);
+export function selectNode(id: string): Promise<GNode> {
+  return authedFetch<GNode>(`/api/nodes/${encodeURIComponent(id)}`);
 }

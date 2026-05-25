@@ -34,9 +34,25 @@ class Settings(BaseSettings):
     # Vite dev server origins for CORS (comma-separated).
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
+    # Supabase Auth: tokens are verified locally against the project's JWKS.
+    # Non-secret; defaults to the confirmed project, override via env if it moves.
+    supabase_url: str = "https://lpbvvqnxoqoedmciukkv.supabase.co"
+    # Supabase issues access tokens with aud="authenticated" for signed-in users.
+    jwt_audience: str = "authenticated"
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def jwks_url(self) -> str:
+        # Asymmetric (ES256/RS256) signing keys; empty until the project migrates
+        # off the legacy HS256 shared secret (see README "Supabase Auth setup").
+        return f"{self.supabase_url}/auth/v1/.well-known/jwks.json"
+
+    @property
+    def jwt_issuer(self) -> str:
+        return f"{self.supabase_url}/auth/v1"
 
     def _url(self, drivername: str, query: dict | None = None) -> URL:
         # URL.create escapes the password correctly (passwords often contain
