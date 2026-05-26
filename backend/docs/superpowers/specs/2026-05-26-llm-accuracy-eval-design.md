@@ -14,7 +14,11 @@ per-model accuracy table plus a detailed results CSV for auditing.
 - **Models under test:** Groq only, via the existing `GROQ_API_KEY`.
 - **Scoring:** binary `correct`/`incorrect` plus a one-line reason from the judge.
 - **Judge:** a single configurable Groq model (defaults to a strong Llama).
-- **Reporting:** console accuracy table + detailed results CSV on disk.
+- **Reporting:** console accuracy table + detailed results CSV on disk. The
+  detailed CSV MUST record, for every `model × question` pair, exactly which
+  question was asked, the model's answer, and whether it was right or wrong
+  (`verdict`) — i.e. per-question right/wrong is always persisted, never just the
+  aggregate.
 - **Errors:** excluded from accuracy (accuracy = correct / (correct + incorrect));
   reported as a separate count.
 - **Scope:** always run the full dataset against all configured models. No CLI
