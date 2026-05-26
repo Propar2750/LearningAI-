@@ -9,6 +9,7 @@ export interface GNode {
   id: string;
   label: string;
   kind: NodeKind;
+  graphId: string;
   turn: Turn;
 }
 
@@ -20,6 +21,11 @@ export interface GLink {
 export interface Graph {
   nodes: GNode[];
   links: GLink[];
+}
+
+export interface GraphSummary {
+  id: string;
+  goal: string;
 }
 
 export type ViewMode = 'graph' | 'chat';

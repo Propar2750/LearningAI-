@@ -16,7 +16,7 @@ from ..auth import CurrentUser, get_current_user
 from ..db import get_session
 from ..models import Edge, Graph, Node
 from ..schemas import Graph as GraphSchema
-from ..schemas import GLink, GNode, Turn
+from ..schemas import GLink, GNode, GraphSummary, Turn
 
 router = APIRouter(prefix="/api", tags=["graph"])
 
@@ -26,8 +26,24 @@ def _to_gnode(n: Node) -> GNode:
         id=str(n.id),
         label=n.heading,
         kind=n.kind,
+        graphId=str(n.graph_id),
         turn=Turn(user=n.input_prompt, assistant=n.ai_output),
     )
+
+
+@router.get("/graphs", response_model=list[GraphSummary])
+async def list_graphs(
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(get_current_user),
+) -> list[GraphSummary]:
+    graphs = (
+        await session.execute(
+            select(Graph)
+            .where(Graph.user_id == user.id)
+            .order_by(Graph.created_at.desc())
+        )
+    ).scalars().all()
+    return [GraphSummary(id=str(g.id), goal=g.goal) for g in graphs]
 
 
 @router.get("/graph", response_model=GraphSchema)

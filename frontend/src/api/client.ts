@@ -1,4 +1,4 @@
-import { Graph, GNode } from '../types';
+import { Graph, GNode, GraphSummary } from '../types';
 import { supabase } from '../lib/supabase';
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL;
@@ -19,6 +19,10 @@ async function authedFetch<T>(path: string): Promise<T> {
 
 export function getGraph(): Promise<Graph> {
   return authedFetch<Graph>('/api/graph');
+}
+
+export function getGraphs(): Promise<GraphSummary[]> {
+  return authedFetch<GraphSummary[]>('/api/graphs');
 }
 
 export function selectNode(id: string): Promise<GNode> {

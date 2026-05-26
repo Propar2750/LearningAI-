@@ -13,10 +13,23 @@ export default function GraphView() {
   const graph = useStore(s => s.graph);
   const selectNode = useStore(s => s.selectNode);
   const selectedNodeId = useStore(s => s.selectedNodeId);
+  const graphs = useStore(s => s.graphs);
+  const selectedGraphId = useStore(s => s.selectedGraphId);
+  const setSelectedGraphId = useStore(s => s.setSelectedGraphId);
 
   const fgRef = useRef<ForceGraphMethods>();
   const [hovered, setHovered] = useState<string | null>(null);
+  const [input, setInput] = useState('');
   const [size, setSize] = useState({ w: window.innerWidth, h: window.innerHeight });
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const text = input.trim();
+    if (!text) return;
+    // Stub — wire this to the backend later.
+    console.log('graph chat submit:', text);
+    setInput('');
+  };
 
   useEffect(() => {
     const onResize = () => setSize({ w: window.innerWidth, h: window.innerHeight });
@@ -24,11 +37,21 @@ export default function GraphView() {
     return () => window.removeEventListener('resize', onResize);
   }, []);
 
-  // Clone the graph data once for ForceGraph2D — it mutates nodes (adds x/y/vx/vy).
-  const data = useMemo(() => ({
-    nodes: graph.nodes.map(n => ({ ...n })),
-    links: graph.links.map(l => ({ ...l })),
-  }), [graph]);
+  // Filter to one graph (null = show all merged), then clone for ForceGraph2D —
+  // it mutates nodes (adds x/y/vx/vy). Links survive only if both endpoints do.
+  const data = useMemo(() => {
+    const nodes = selectedGraphId
+      ? graph.nodes.filter(n => n.graphId === selectedGraphId)
+      : graph.nodes;
+    const ids = new Set(nodes.map(n => n.id));
+    const links = graph.links.filter(
+      l => ids.has(l.source as string) && ids.has(l.target as string),
+    );
+    return {
+      nodes: nodes.map(n => ({ ...n })),
+      links: links.map(l => ({ ...l })),
+    };
+  }, [graph, selectedGraphId]);
 
   const adjacency = useMemo(() => {
     const m = new Map<string, Set<string>>();
@@ -104,6 +127,31 @@ export default function GraphView() {
         <div className="font-semibold text-neutral-200">Learning.AI</div>
         <div>hover: highlight neighborhood · click a node to open its conversation</div>
       </div>
+      {graphs.length > 1 && (
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10">
+          <select
+            value={selectedGraphId ?? ''}
+            onChange={(e) => setSelectedGraphId(e.target.value || null)}
+            className="max-w-xs truncate rounded-lg border border-neutral-700 bg-neutral-900/80 backdrop-blur px-3 py-1.5 text-sm text-neutral-200 hover:border-neutral-500 focus:outline-none"
+          >
+            <option value="">All graphs</option>
+            {graphs.map(g => (
+              <option key={g.id} value={g.id}>{g.goal}</option>
+            ))}
+          </select>
+        </div>
+      )}
+      <footer className="absolute bottom-0 inset-x-0 px-6 py-4 border-t border-neutral-800 bg-neutral-950/90 backdrop-blur">
+        <form onSubmit={handleSubmit} className="max-w-2xl mx-auto">
+          <input
+            type="text"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="Ask a question…"
+            className="w-full rounded-lg bg-neutral-900 border border-neutral-800 px-4 py-3 text-sm text-neutral-100 placeholder-neutral-600 focus:outline-none"
+          />
+        </form>
+      </footer>
     </div>
   );
 }
