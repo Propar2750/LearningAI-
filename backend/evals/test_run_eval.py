@@ -49,3 +49,28 @@ def test_load_dataset_missing_required_column(tmp_path):
     _write_csv(p, ["Topic", "Question"], [["X", "Q"]])
     with pytest.raises(ValueError, match="Correct_Answer"):
         run_eval.load_dataset(str(p))
+
+
+def test_parse_judge_clean_json():
+    raw = '{"verdict": "correct", "reason": "matches reference"}'
+    assert run_eval.parse_judge_response(raw) == ("correct", "matches reference")
+
+
+def test_parse_judge_uppercase_verdict_normalized():
+    raw = '{"verdict": "INCORRECT", "reason": "wrong number"}'
+    assert run_eval.parse_judge_response(raw) == ("incorrect", "wrong number")
+
+
+def test_parse_judge_with_surrounding_text():
+    raw = 'Here is my answer:\n{"verdict": "correct", "reason": "ok"} Thanks!'
+    assert run_eval.parse_judge_response(raw) == ("correct", "ok")
+
+
+def test_parse_judge_invalid_verdict_raises():
+    with pytest.raises(ValueError):
+        run_eval.parse_judge_response('{"verdict": "maybe", "reason": "x"}')
+
+
+def test_parse_judge_bad_json_raises():
+    with pytest.raises(ValueError):
+        run_eval.parse_judge_response("not json at all")

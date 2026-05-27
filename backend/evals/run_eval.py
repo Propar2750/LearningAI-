@@ -68,3 +68,30 @@ def load_dataset(path: str) -> list[dict]:
                 "expected_answer": expected,
             })
         return rows
+
+
+def parse_judge_response(raw: str) -> tuple[str, str]:
+    """Parse judge output into (verdict, reason).
+
+    Accepts a bare JSON object or one embedded in surrounding text.
+    Raises ValueError if it cannot be parsed or the verdict is not
+    'correct'/'incorrect'.
+    """
+    text = (raw or "").strip()
+    data = None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                data = json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                data = None
+    if not isinstance(data, dict) or "verdict" not in data:
+        raise ValueError(f"could not parse judge response: {raw!r}")
+    verdict = str(data["verdict"]).strip().lower()
+    if verdict not in ("correct", "incorrect"):
+        raise ValueError(f"unexpected verdict {verdict!r} in: {raw!r}")
+    reason = str(data.get("reason", "")).strip()
+    return verdict, reason
