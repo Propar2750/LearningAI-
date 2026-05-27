@@ -8,18 +8,25 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import groq
+from groq import Groq
+from dotenv import load_dotenv
+
 # ----- Config (override via environment) -----
+# Only models enabled for this Groq org work; others return 403. List the
+# enabled ones with: client.models.list(). Override the set below via EVAL_MODELS.
 _DEFAULT_MODELS = [
-    "llama-3.3-70b-versatile",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
     "llama-3.1-8b-instant",
-    "gemma2-9b-it",
 ]
 MODELS = (
     [m.strip() for m in os.environ["EVAL_MODELS"].split(",") if m.strip()]
     if os.environ.get("EVAL_MODELS")
     else _DEFAULT_MODELS
 )
-JUDGE_MODEL = os.environ.get("EVAL_JUDGE_MODEL", "llama-3.3-70b-versatile")
+JUDGE_MODEL = os.environ.get(
+    "EVAL_JUDGE_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
+)
 REQUEST_DELAY = float(os.environ.get("EVAL_REQUEST_DELAY", "0.5"))
 MAX_RETRIES = 3
 BASE_BACKOFF = 1.0  # seconds
@@ -146,3 +153,110 @@ def write_results(records: list[dict], path: str) -> None:
         writer.writeheader()
         for r in records:
             writer.writerow({k: r.get(k, "") for k in RESULT_FIELDS})
+
+
+JUDGE_SYSTEM = (
+    "You are a strict grader. You compare a candidate answer to a reference "
+    "answer for a question and decide if the candidate is factually correct. "
+    "Judge factual/semantic correctness, not wording, length, or style; a "
+    "correct answer may be phrased differently from the reference. Respond with "
+    "ONLY a JSON object and nothing else, in the form "
+    '{"verdict": "correct" or "incorrect", "reason": "<one short sentence>"}.'
+)
+
+
+def build_judge_messages(question: str, expected: str, answer: str) -> list[dict]:
+    user = (
+        f"Question:\n{question}\n\n"
+        f"Reference answer:\n{expected}\n\n"
+        f"Candidate answer:\n{answer}\n\n"
+        "Is the candidate answer correct?"
+    )
+    return [
+        {"role": "system", "content": JUDGE_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+
+
+def groq_chat(client: Groq, model: str, messages: list[dict]) -> str:
+    """Call Groq chat completions with retry/backoff on API errors."""
+    last_exc = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = client.chat.completions.create(
+                model=model, messages=messages, temperature=0,
+            )
+            return resp.choices[0].message.content or ""
+        except groq.APIError as exc:  # base class for rate-limit/status/conn errors
+            last_exc = exc
+            if attempt == MAX_RETRIES - 1:
+                break
+            time.sleep(BASE_BACKOFF * (2 ** attempt))
+    raise last_exc
+
+
+def ask_model(client: Groq, model: str, question: str) -> str:
+    return groq_chat(client, model, [{"role": "user", "content": question}])
+
+
+def judge(client: Groq, question: str, expected: str, answer: str) -> tuple[str, str]:
+    """Grade an answer. Never raises: returns ('error', detail) on failure."""
+    messages = build_judge_messages(question, expected, answer)
+    last_raw = ""
+    for _ in range(2):  # one retry on unparseable JSON
+        try:
+            last_raw = groq_chat(client, JUDGE_MODEL, messages)
+        except groq.APIError as exc:
+            return "error", f"judge API error: {exc}"
+        try:
+            return parse_judge_response(last_raw)
+        except ValueError:
+            continue
+    return "error", f"unparseable judge response: {last_raw[:200]!r}"
+
+
+def main() -> None:
+    load_dotenv(ENV_PATH)
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise SystemExit(f"GROQ_API_KEY not found (looked in {ENV_PATH})")
+    client = Groq(api_key=api_key)
+
+    dataset = load_dataset(str(QA_PATH))
+    if not dataset:
+        raise SystemExit(f"No questions found in {QA_PATH}")
+    print(f"Loaded {len(dataset)} questions; testing {len(MODELS)} model(s); "
+          f"judge={JUDGE_MODEL}\n")
+
+    records: list[dict] = []
+    for model in MODELS:
+        print(f"== {model} ==")
+        for row in dataset:
+            base = {
+                "model": model, "id": row["id"], "category": row["category"],
+                "question": row["question"], "expected_answer": row["expected_answer"],
+            }
+            try:
+                answer = ask_model(client, model, row["question"])
+                verdict, reason = judge(
+                    client, row["question"], row["expected_answer"], answer
+                )
+            except groq.APIError as exc:
+                answer, verdict, reason = "", "error", f"model API error: {exc}"
+            records.append({**base, "model_answer": answer,
+                            "verdict": verdict, "reason": reason})
+            print(f"  [{verdict}] #{row['id']} {row['question'][:50]}")
+            time.sleep(REQUEST_DELAY)
+        print()
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = RESULTS_DIR / f"results_{ts}.csv"
+    write_results(records, str(out_path))
+
+    print(format_table(summarize(records)))
+    print(f"\nDetailed results written to {out_path}")
+
+
+if __name__ == "__main__":
+    main()
