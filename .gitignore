@@ -6,6 +6,8 @@ build/
 *.log
 *.log.*
 .DS_Store
+# drawio editor scratch/backup files
+.$*
 __pycache__/
 *.pyc
 .vite/
