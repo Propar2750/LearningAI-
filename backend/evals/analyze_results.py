@@ -67,6 +67,17 @@ def combine_records(paths: list[str]) -> list[dict]:
     return list(merged.values())
 
 
+def exclude_models(records: list[dict], exclude: list[str]) -> list[dict]:
+    """Drop records whose ``model`` label is in ``exclude`` (exact match).
+
+    Matching is on the full label, so excluding a default label (e.g.
+    ``gpt-oss-20b``) leaves any reasoning-suffixed sibling (``gpt-oss-20b@low``)
+    untouched. Use this to drop runs with unreliable/missing data.
+    """
+    skip = set(exclude)
+    return [r for r in records if r.get("model", "") not in skip]
+
+
 def load_pricing(path: str) -> dict:
     """Read pricing.json: {'default': {in,out}, 'models': {name: {in,out}}}."""
     with open(path, encoding="utf-8") as f:
@@ -76,24 +87,30 @@ def load_pricing(path: str) -> dict:
 def model_costs(records: list[dict], pricing: dict) -> list[dict]:
     """Per-model USD cost from model-under-test tokens, in first-seen order.
 
-    cost = model_in/1e6 * rate_in + model_out/1e6 * rate_out. Models absent from
+    cost = model_in/1e6 * rate_in + model_out/1e6 * rate_out. Pricing is keyed by
+    the real model id (``model_id``, falling back to the label for older results
+    that predate it), since the label may carry a reasoning suffix. Reasoning
+    tokens are already inside ``model_out`` (billed as output), so they need no
+    separate rate; ``reasoning`` is reported for visibility. Models absent from
     the pricing config fall back to ``default`` (with a warning). Returns dicts
-    of {model, model_in, model_out, cost}.
+    of {model, model_in, model_out, reasoning, cost}.
     """
     rates = pricing.get("models", {})
     default = pricing.get("default", {"in": 0.0, "out": 0.0})
     out = []
     for t in token_totals(records):
         model = t["model"]
-        rate = rates.get(model)
+        price_key = t.get("model_id") or model
+        rate = rates.get(price_key)
         if rate is None:
-            logger.warning("no pricing for %r; using default rate", model)
+            logger.warning("no pricing for %r; using default rate", price_key)
             rate = default
         cost = (t["model_in"] / 1e6) * rate.get("in", 0.0) + \
                (t["model_out"] / 1e6) * rate.get("out", 0.0)
         out.append({
             "model": model, "model_in": t["model_in"],
-            "model_out": t["model_out"], "cost": cost,
+            "model_out": t["model_out"], "reasoning": t["reasoning"],
+            "cost": cost,
         })
     return out
 
@@ -270,6 +287,9 @@ def main() -> None:
     parser.add_argument("--pricing", default=str(DEFAULT_PRICING),
                         help="pricing JSON (default: pricing.json beside this script)")
     parser.add_argument("--outdir", help="output dir (default: results/analysis)")
+    parser.add_argument("--exclude-model", nargs="+", default=[], metavar="LABEL",
+                        help="model label(s) to drop before analysis, e.g. a run "
+                             "with too much missing data (exact match)")
     args = parser.parse_args()
 
     # matplotlib must pick a headless backend before pyplot is imported.
@@ -285,6 +305,14 @@ def main() -> None:
     records = combine_records(paths)
     if not records:
         raise SystemExit(f"No rows in: {', '.join(paths)}")
+    if args.exclude_model:
+        before = len(records)
+        records = exclude_models(records, args.exclude_model)
+        if not records:
+            raise SystemExit(f"All rows excluded by --exclude-model "
+                             f"{', '.join(args.exclude_model)}")
+        print(f"Excluded {', '.join(args.exclude_model)} "
+              f"({before - len(records)} rows dropped)")
     pricing = load_pricing(args.pricing)
 
     models = list(dict.fromkeys(r["model"] for r in records))
@@ -292,6 +320,14 @@ def main() -> None:
     for p in paths:
         print(f"  - {p}")
     print(f"Models: {', '.join(models)}")
+
+    # Reasoning tokens are a subset of output tokens; show how much of each
+    # model's output went to reasoning (0% for non-reasoning models).
+    print("Reasoning tokens per model (share of output):")
+    for t in token_totals(records):
+        share = (100.0 * t["reasoning"] / t["model_out"]) if t["model_out"] else 0.0
+        print(f"  {t['model']:<42} reasoning={t['reasoning']} "
+              f"({share:.1f}% of {t['model_out']} out)")
 
     outputs = {
         "01_overall_accuracy.png": lambda p: plot_overall_accuracy(records, p),

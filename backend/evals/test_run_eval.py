@@ -209,24 +209,84 @@ from types import SimpleNamespace
 
 def test_usage_from_response_reads_tokens():
     resp = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=42, completion_tokens=7))
-    assert run_eval.usage_from_response(resp) == {"in": 42, "out": 7}
+    assert run_eval.usage_from_response(resp) == {"in": 42, "out": 7, "reasoning": 0}
+
+
+def test_usage_from_response_reads_reasoning_tokens():
+    resp = SimpleNamespace(usage=SimpleNamespace(
+        prompt_tokens=42, completion_tokens=20,
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=13)))
+    assert run_eval.usage_from_response(resp) == {"in": 42, "out": 20, "reasoning": 13}
 
 
 def test_usage_from_response_handles_missing_usage():
     resp = SimpleNamespace(usage=None)
-    assert run_eval.usage_from_response(resp) == {"in": 0, "out": 0}
+    assert run_eval.usage_from_response(resp) == {"in": 0, "out": 0, "reasoning": 0}
 
 
 def test_token_totals_sums_per_model_in_order():
     records = [
-        {"model": "Z", "model_tokens_in": 10, "model_tokens_out": 5,
+        {"model": "Z", "model_id": "z-real", "model_tokens_in": 10,
+         "model_tokens_out": 5, "model_reasoning_tokens": 2,
          "judge_tokens_in": 3, "judge_tokens_out": 1},
-        {"model": "Z", "model_tokens_in": 20, "model_tokens_out": 8,
+        {"model": "Z", "model_id": "z-real", "model_tokens_in": 20,
+         "model_tokens_out": 8, "model_reasoning_tokens": 3,
          "judge_tokens_in": 4, "judge_tokens_out": 2},
         {"model": "A", "model_tokens_in": 1, "model_tokens_out": 1,
          "judge_tokens_in": 1, "judge_tokens_out": 1},
     ]
     totals = run_eval.token_totals(records)
     assert [t["model"] for t in totals] == ["Z", "A"]
-    assert totals[0] == {"model": "Z", "model_in": 30, "model_out": 13,
+    assert totals[0] == {"model": "Z", "model_id": "z-real", "model_in": 30,
+                         "model_out": 13, "reasoning": 5,
                          "judge_in": 7, "judge_out": 3}
+    # No model_id column -> falls back to the label.
+    assert totals[1]["model_id"] == "A" and totals[1]["reasoning"] == 0
+
+
+def test_parse_run_spec_efforts_and_labels():
+    assert run_eval.parse_run_spec("openai/gpt-oss-120b@high") == {
+        "label": "openai/gpt-oss-120b@high", "model": "openai/gpt-oss-120b",
+        "reasoning_effort": "high", "reasoning_format": None}
+    # "on" enables qwen reasoning ("default") and selects the parsed format.
+    assert run_eval.parse_run_spec("qwen/qwen3-32b@on") == {
+        "label": "qwen/qwen3-32b@on", "model": "qwen/qwen3-32b",
+        "reasoning_effort": "default", "reasoning_format": "parsed"}
+    assert run_eval.parse_run_spec("qwen/qwen3-32b@off")["reasoning_effort"] == "none"
+    # Bare model: no reasoning params, label is the model id (backward compatible).
+    assert run_eval.parse_run_spec("llama-3.3-70b-versatile") == {
+        "label": "llama-3.3-70b-versatile", "model": "llama-3.3-70b-versatile",
+        "reasoning_effort": None, "reasoning_format": None}
+
+
+def test_groq_chat_forwards_reasoning_params_only_when_set():
+    calls = []
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions()))
+
+    content, usage = run_eval.groq_chat(client, "m", [{"role": "user", "content": "q"}])
+    assert content == "ok" and "reasoning_effort" not in calls[-1]
+    assert "reasoning_format" not in calls[-1]
+    # The completion-token cap is sent by default so reasoning can't truncate the answer.
+    assert calls[-1]["max_completion_tokens"] == run_eval.MAX_COMPLETION_TOKENS
+
+    run_eval.groq_chat(client, "m", [{"role": "user", "content": "q"}],
+                       reasoning_effort="high")
+    assert calls[-1]["reasoning_effort"] == "high"
+    assert "reasoning_format" not in calls[-1]
+
+    run_eval.groq_chat(client, "qwen/qwen3-32b", [{"role": "user", "content": "q"}],
+                       reasoning_effort="default", reasoning_format="parsed")
+    assert calls[-1]["reasoning_effort"] == "default"
+    assert calls[-1]["reasoning_format"] == "parsed"
+
+    run_eval.groq_chat(client, "m", [{"role": "user", "content": "q"}],
+                       max_completion_tokens=None)
+    assert "max_completion_tokens" not in calls[-1]

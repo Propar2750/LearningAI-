@@ -16,30 +16,71 @@ from groq import Groq
 from dotenv import load_dotenv
 
 # ----- Config (override via environment) -----
-# Only models enabled for this Groq org work; others return 403. List the
-# enabled ones with: client.models.list(). Override the set below via EVAL_MODELS.
-_DEFAULT_MODELS = [
-    # Already run (results_20260527_152731.csv) — uncomment to re-run:
-    # "meta-llama/llama-4-scout-17b-16e-instruct",
-    # "llama-3.1-8b-instant",
-    "llama-3.3-70b-versatile",
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "qwen/qwen3-32b",
-    # Dropped — usage-based pricing + per-search web fees make these the
-    # costliest/slowest; uncomment to include:
-    # "groq/compound",
-    # "groq/compound-mini",
+# A "run" pairs a Groq model with a reasoning setting. ``label`` is the grouping
+# key written to results (so the same model at different reasoning efforts stays
+# distinct); ``model`` is the real id used for the API call and pricing lookup.
+#
+# Reasoning notes: gpt-oss-120b/20b accept reasoning_effort low|medium|high
+# (default medium, can't be disabled) and do NOT support reasoning_format. qwen3
+# accepts none|default|low|medium|high (none disables) and supports
+# reasoning_format — we set "parsed" so message.content holds only the final
+# answer. Llama models have no reasoning. Only models enabled for this Groq org
+# work; others return 403 (list with client.models.list()).
+#
+# Defaults below are the configs not yet run: qwen reasoning on, and gpt-oss at
+# low/high (medium is the default already covered by earlier untracked runs).
+_DEFAULT_RUNS = [
+    {"label": "qwen/qwen3-32b@on", "model": "qwen/qwen3-32b",
+     "reasoning_effort": "default", "reasoning_format": "parsed"},
+    {"label": "openai/gpt-oss-120b@low", "model": "openai/gpt-oss-120b",
+     "reasoning_effort": "low", "reasoning_format": None},
+    {"label": "openai/gpt-oss-120b@high", "model": "openai/gpt-oss-120b",
+     "reasoning_effort": "high", "reasoning_format": None},
+    {"label": "openai/gpt-oss-20b@low", "model": "openai/gpt-oss-20b",
+     "reasoning_effort": "low", "reasoning_format": None},
+    {"label": "openai/gpt-oss-20b@high", "model": "openai/gpt-oss-20b",
+     "reasoning_effort": "high", "reasoning_format": None},
 ]
-MODELS = (
-    [m.strip() for m in os.environ["EVAL_MODELS"].split(",") if m.strip()]
+
+
+def parse_run_spec(entry: str) -> dict:
+    """Parse an ``EVAL_MODELS`` entry ("model" or "model@suffix") into a run spec.
+
+    Suffix maps to a Groq reasoning_effort: low/medium/high pass through, "on"
+    enables reasoning ("default"), "off"/"none" disable it. No suffix means no
+    reasoning params are sent (backward compatible). reasoning_format is "parsed"
+    only for qwen models with reasoning enabled (gpt-oss rejects the param).
+    """
+    entry = entry.strip()
+    model, _, suffix = entry.partition("@")
+    model, suffix = model.strip(), suffix.strip().lower()
+    effort = {
+        "": None, "low": "low", "medium": "medium", "high": "high",
+        "on": "default", "off": "none", "none": "none",
+    }.get(suffix, suffix)
+    enabled = effort not in (None, "none")
+    fmt = "parsed" if (enabled and "qwen" in model) else None
+    return {"label": entry, "model": model,
+            "reasoning_effort": effort, "reasoning_format": fmt}
+
+
+RUNS = (
+    [parse_run_spec(e) for e in os.environ["EVAL_MODELS"].split(",") if e.strip()]
     if os.environ.get("EVAL_MODELS")
-    else _DEFAULT_MODELS
+    else _DEFAULT_RUNS
 )
 JUDGE_MODEL = os.environ.get(
     "EVAL_JUDGE_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
 )
 REQUEST_DELAY = float(os.environ.get("EVAL_REQUEST_DELAY", "0.5"))
+# Cap on tokens generated per call — for reasoning models this covers reasoning
+# AND the visible answer combined. Set high so high reasoning effort can't
+# consume the whole budget and leave the answer truncated (the cause of empty
+# answers at the per-model defaults of 2048/3072 — a single high-effort JEE
+# question was measured using ~15.8k tokens). You only pay for tokens actually
+# generated, so a generous cap costs nothing extra. Within every model's output
+# limit (gpt-oss 65536, qwen3-32b 40960). Override via EVAL_MAX_COMPLETION_TOKENS.
+MAX_COMPLETION_TOKENS = int(os.environ.get("EVAL_MAX_COMPLETION_TOKENS", "32768"))
 MAX_RETRIES = 3
 BASE_BACKOFF = 1.0  # seconds
 
@@ -60,9 +101,10 @@ ANSWER_COL = "Correct_Answer"
 CATEGORY_COL = "Topic"
 
 RESULT_FIELDS = [
-    "model", "id", "category", "question",
+    # ``model`` is the run label (grouping key); ``model_id`` is the real Groq id.
+    "model", "model_id", "reasoning_effort", "id", "category", "question",
     "expected_answer", "model_answer", "verdict", "reason", "judge_raw",
-    "model_tokens_in", "model_tokens_out",
+    "model_tokens_in", "model_tokens_out", "model_reasoning_tokens",
     "judge_tokens_in", "judge_tokens_out",
 ]
 
@@ -222,17 +264,25 @@ def summarize(records: list[dict]) -> list[dict]:
 
 
 def token_totals(records: list[dict]) -> list[dict]:
-    """Sum model and judge token usage per model, in first-seen order."""
+    """Sum model and judge token usage per model label, in first-seen order.
+
+    ``reasoning`` is a subset of ``model_out`` (reasoning tokens are billed as
+    output tokens), broken out here for visibility. ``model_id`` carries the real
+    Groq id (first-seen) so callers can look up pricing; it falls back to the
+    label for older results that predate the model_id column.
+    """
     order: list[str] = []
     totals: dict[str, dict] = {}
     for r in records:
         m = r["model"]
         if m not in totals:
             order.append(m)
-            totals[m] = {"model_in": 0, "model_out": 0,
+            totals[m] = {"model_id": r.get("model_id") or m,
+                         "model_in": 0, "model_out": 0, "reasoning": 0,
                          "judge_in": 0, "judge_out": 0}
         totals[m]["model_in"] += int(r.get("model_tokens_in") or 0)
         totals[m]["model_out"] += int(r.get("model_tokens_out") or 0)
+        totals[m]["reasoning"] += int(r.get("model_reasoning_tokens") or 0)
         totals[m]["judge_in"] += int(r.get("judge_tokens_in") or 0)
         totals[m]["judge_out"] += int(r.get("judge_tokens_out") or 0)
     return [{"model": m, **totals[m]} for m in order]
@@ -284,27 +334,46 @@ def build_judge_messages(question: str, expected: str, answer: str) -> list[dict
 
 
 def usage_from_response(resp) -> dict:
-    """Extract token usage from a Groq chat response as {'in': int, 'out': int}."""
+    """Extract token usage as {'in': int, 'out': int, 'reasoning': int}.
+
+    'reasoning' is the reasoning-token count (0 for non-reasoning models/calls)
+    and is a subset of 'out' — reasoning tokens are billed as output tokens.
+    """
     u = getattr(resp, "usage", None)
     if u is None:
-        return {"in": 0, "out": 0}
+        return {"in": 0, "out": 0, "reasoning": 0}
+    details = getattr(u, "completion_tokens_details", None)
+    reasoning = int(getattr(details, "reasoning_tokens", 0) or 0) if details else 0
     return {
         "in": int(getattr(u, "prompt_tokens", 0) or 0),
         "out": int(getattr(u, "completion_tokens", 0) or 0),
+        "reasoning": reasoning,
     }
 
 
-def groq_chat(client: Groq, model: str, messages: list[dict]) -> tuple[str, dict]:
+def groq_chat(
+    client: Groq, model: str, messages: list[dict],
+    reasoning_effort: str | None = None, reasoning_format: str | None = None,
+    max_completion_tokens: int | None = MAX_COMPLETION_TOKENS,
+) -> tuple[str, dict]:
     """Call Groq chat completions with retry/backoff on API errors.
 
-    Returns (content, usage) where usage is {'in': int, 'out': int}.
+    reasoning_effort/reasoning_format are forwarded only when set (gpt-oss
+    rejects reasoning_format, so leave it None for those models).
+    max_completion_tokens caps reasoning + answer; sent unless None. Returns
+    (content, usage) where usage is {'in': int, 'out': int, 'reasoning': int}.
     """
+    kwargs: dict = {"model": model, "messages": messages, "temperature": 0}
+    if reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
+    if reasoning_format is not None:
+        kwargs["reasoning_format"] = reasoning_format
+    if max_completion_tokens is not None:
+        kwargs["max_completion_tokens"] = max_completion_tokens
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
-            resp = client.chat.completions.create(
-                model=model, messages=messages, temperature=0,
-            )
+            resp = client.chat.completions.create(**kwargs)
             return (resp.choices[0].message.content or ""), usage_from_response(resp)
         except groq.APIError as exc:  # base class for rate-limit/status/conn errors
             last_exc = exc
@@ -319,9 +388,13 @@ def groq_chat(client: Groq, model: str, messages: list[dict]) -> tuple[str, dict
     raise last_exc
 
 
-def ask_model(client: Groq, model: str, question: str) -> tuple[str, dict]:
-    """Return (answer, usage) for the model's reply to a bare question."""
-    return groq_chat(client, model, [{"role": "user", "content": question}])
+def ask_model(client: Groq, run: dict, question: str) -> tuple[str, dict]:
+    """Return (answer, usage) for a run spec's reply to a bare question."""
+    return groq_chat(
+        client, run["model"], [{"role": "user", "content": question}],
+        reasoning_effort=run.get("reasoning_effort"),
+        reasoning_format=run.get("reasoning_format"),
+    )
 
 
 def judge(
@@ -334,13 +407,13 @@ def judge(
     """
     messages = build_judge_messages(question, expected, answer)
     last_raw = ""
-    usage = {"in": 0, "out": 0}
+    usage = {"in": 0, "out": 0, "reasoning": 0}
     for _ in range(2):  # one retry on unparseable JSON
         try:
             last_raw, usage = groq_chat(client, JUDGE_MODEL, messages)
         except groq.APIError as exc:
             logger.warning("judge API error: %s", exc)
-            return "error", f"judge API error: {exc}", "", {"in": 0, "out": 0}
+            return "error", f"judge API error: {exc}", "", {"in": 0, "out": 0, "reasoning": 0}
         try:
             verdict, reason = parse_judge_response(last_raw)
             return verdict, reason, last_raw, usage
@@ -361,45 +434,50 @@ def main() -> None:
     dataset = load_dataset(str(QA_PATH))
     if not dataset:
         raise SystemExit(f"No questions found in {QA_PATH}")
-    print(f"Loaded {len(dataset)} questions; testing {len(MODELS)} model(s); "
+    print(f"Loaded {len(dataset)} questions; testing {len(RUNS)} run(s); "
           f"judge={JUDGE_MODEL}\n")
 
     records: list[dict] = []
     total = len(dataset)
     w = len(str(total))
-    for model in MODELS:
-        print(f"== {model} ==")
+    for run in RUNS:
+        label = run["label"]
+        print(f"== {label} ==")
         for i, row in enumerate(dataset, start=1):
             base = {
-                "model": model, "id": row["id"], "category": row["category"],
+                "model": label, "model_id": run["model"],
+                "reasoning_effort": run.get("reasoning_effort") or "",
+                "id": row["id"], "category": row["category"],
                 "question": row["question"], "expected_answer": row["expected_answer"],
             }
-            zero = {"in": 0, "out": 0}
+            zero = {"in": 0, "out": 0, "reasoning": 0}
             judge_raw = ""
             t0 = time.perf_counter()
             try:
-                answer, m_usage = ask_model(client, model, row["question"])
+                answer, m_usage = ask_model(client, run, row["question"])
                 verdict, reason, judge_raw, j_usage = judge(
                     client, row["question"], row["expected_answer"], answer
                 )
             except groq.APIError as exc:
                 answer, verdict, reason = "", "error", f"model API error: {exc}"
                 m_usage, j_usage = zero, zero
-                logger.warning("%s model API error on #%s: %s", model, row["id"], exc)
+                logger.warning("%s model API error on #%s: %s", label, row["id"], exc)
             elapsed = time.perf_counter() - t0
             records.append({
                 **base, "model_answer": answer,
                 "verdict": verdict, "reason": reason, "judge_raw": judge_raw,
                 "model_tokens_in": m_usage["in"], "model_tokens_out": m_usage["out"],
+                "model_reasoning_tokens": m_usage["reasoning"],
                 "judge_tokens_in": j_usage["in"], "judge_tokens_out": j_usage["out"],
             })
             logger.info(
                 "model=%s id=%s category=%s verdict=%s elapsed=%.1fs\n"
                 "QUESTION:\n%s\nMODEL_ANSWER:\n%s\nJUDGE_RAW:\n%s\n"
-                "REASON: %s\nTOKENS model=%d/%d judge=%d/%d",
-                model, row["id"], row["category"], verdict, elapsed,
+                "REASON: %s\nTOKENS model=%d/%d (reasoning %d) judge=%d/%d",
+                label, row["id"], row["category"], verdict, elapsed,
                 row["question"], answer, judge_raw, reason,
-                m_usage["in"], m_usage["out"], j_usage["in"], j_usage["out"],
+                m_usage["in"], m_usage["out"], m_usage["reasoning"],
+                j_usage["in"], j_usage["out"],
             )
             print(f"  [{i:>{w}}/{total}] #{row['id']:<3} {row['category']:<10} "
                   f"[{verdict}] {elapsed:5.1f}s")
@@ -412,10 +490,10 @@ def main() -> None:
     write_results(records, str(out_path))
 
     print(format_table(summarize(records)))
-    print("\nToken usage per model (in/out):")
+    print("\nToken usage per model (in/out; reasoning is a subset of out):")
     for t in token_totals(records):
-        print(f"  {t['model']:<42} answer={t['model_in']}/{t['model_out']}  "
-              f"judge={t['judge_in']}/{t['judge_out']}")
+        print(f"  {t['model']:<42} answer={t['model_in']}/{t['model_out']} "
+              f"(reasoning {t['reasoning']})  judge={t['judge_in']}/{t['judge_out']}")
     print(f"\nDetailed results written to {out_path}")
 
 

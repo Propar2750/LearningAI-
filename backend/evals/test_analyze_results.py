@@ -11,9 +11,11 @@ def _write_csv(path, header, rows):
         w.writerows(rows)
 
 
-def _rec(model, category, verdict, m_in=0, m_out=0):
-    return {"model": model, "category": category, "verdict": verdict,
+def _rec(model, category, verdict, m_in=0, m_out=0, m_reasoning=0, model_id=None):
+    return {"model": model, "model_id": model_id or model,
+            "category": category, "verdict": verdict,
             "model_tokens_in": m_in, "model_tokens_out": m_out,
+            "model_reasoning_tokens": m_reasoning,
             "judge_tokens_in": 999, "judge_tokens_out": 999}
 
 
@@ -63,6 +65,26 @@ def test_combine_records_later_file_overrides_same_model_id(tmp_path):
     assert merged[0]["verdict"] == "correct"
 
 
+# ----- exclude_models -----
+
+def test_exclude_models_drops_listed_label():
+    records = [_rec("A", "X", "correct"), _rec("B", "X", "correct")]
+    kept = ar.exclude_models(records, ["B"])
+    assert [r["model"] for r in kept] == ["A"]
+
+
+def test_exclude_models_is_exact_label_match():
+    # The default label must not also drop its reasoning-suffixed sibling.
+    records = [_rec("gpt", "X", "correct"), _rec("gpt@low", "X", "correct")]
+    kept = ar.exclude_models(records, ["gpt"])
+    assert [r["model"] for r in kept] == ["gpt@low"]
+
+
+def test_exclude_models_empty_list_keeps_all():
+    records = [_rec("A", "X", "correct"), _rec("B", "X", "correct")]
+    assert ar.exclude_models(records, []) == records
+
+
 # ----- model_costs -----
 
 def test_model_costs_math():
@@ -96,6 +118,19 @@ def test_model_costs_zero_tokens_is_zero():
                "models": {"A": {"in": 1.0, "out": 1.0}}}
     records = [_rec("A", "X", "error", m_in=0, m_out=0)]
     assert ar.model_costs(records, pricing)[0]["cost"] == pytest.approx(0.0)
+
+
+def test_model_costs_pricing_resolves_via_model_id():
+    # The label carries a reasoning suffix; pricing is keyed by the real id.
+    pricing = {"default": {"in": 0.0, "out": 0.0},
+               "models": {"gpt": {"in": 1.0, "out": 2.0}}}
+    records = [_rec("gpt@high", "X", "correct", m_in=1_000_000, m_out=500_000,
+                    m_reasoning=300_000, model_id="gpt")]
+    cost = ar.model_costs(records, pricing)[0]
+    assert cost["model"] == "gpt@high"
+    # Reasoning tokens are inside model_out, so cost is unchanged by them.
+    assert cost["cost"] == pytest.approx(2.0)
+    assert cost["reasoning"] == 300_000
 
 
 # ----- category_accuracy -----
