@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
+import re
 import time
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import groq
@@ -16,8 +19,17 @@ from dotenv import load_dotenv
 # Only models enabled for this Groq org work; others return 403. List the
 # enabled ones with: client.models.list(). Override the set below via EVAL_MODELS.
 _DEFAULT_MODELS = [
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "llama-3.1-8b-instant",
+    # Already run (results_20260527_152731.csv) — uncomment to re-run:
+    # "meta-llama/llama-4-scout-17b-16e-instruct",
+    # "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3-32b",
+    # Dropped — usage-based pricing + per-search web fees make these the
+    # costliest/slowest; uncomment to include:
+    # "groq/compound",
+    # "groq/compound-mini",
 ]
 MODELS = (
     [m.strip() for m in os.environ["EVAL_MODELS"].split(",") if m.strip()]
@@ -36,6 +48,11 @@ _THIS_DIR = Path(__file__).resolve().parent
 QA_PATH = _THIS_DIR.parent.parent / "qa.csv"
 ENV_PATH = _THIS_DIR.parent.parent / ".env"
 RESULTS_DIR = _THIS_DIR / "results"
+# Full per-question inputs/outputs go here for debugging; rotated by size,
+# appended across runs. File only — never printed to the console.
+LOG_PATH = _THIS_DIR / "eval.log"
+
+logger = logging.getLogger("evals.run_eval")
 
 # qa.csv column names mapped to internal record keys.
 QUESTION_COL = "Question"
@@ -44,7 +61,7 @@ CATEGORY_COL = "Topic"
 
 RESULT_FIELDS = [
     "model", "id", "category", "question",
-    "expected_answer", "model_answer", "verdict", "reason",
+    "expected_answer", "model_answer", "verdict", "reason", "judge_raw",
     "model_tokens_in", "model_tokens_out",
     "judge_tokens_in", "judge_tokens_out",
 ]
@@ -79,24 +96,93 @@ def load_dataset(path: str) -> list[dict]:
         return rows
 
 
+def setup_logging() -> None:
+    """Attach a size-rotated file handler to the module logger.
+
+    The log file is the only sink (propagate is off), so full prompts and
+    responses are written to LOG_PATH but never reach the console. Safe to
+    call more than once: it won't add duplicate handlers.
+    """
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    if any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+        return
+    handler = RotatingFileHandler(
+        LOG_PATH, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+    )
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+
+
+_FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*(.*?)\s*```$", re.DOTALL)
+# Fallbacks for when the judge emits JSON the loader can't read: LaTeX-escaped
+# braces (`$\{...\}$`) or a reply truncated mid-string. Match the verdict/reason
+# keys directly. `\W{0,4}` spans the `": "` (and an optional opening quote).
+_VERDICT_RE = re.compile(r"verdict\W{0,4}(correct|incorrect)", re.IGNORECASE)
+_REASON_RE = re.compile(r'reason\W{0,4}"((?:[^"\\]|\\.)*)"', re.IGNORECASE)
+
+
+def _iter_json_objects(text: str):
+    """Yield balanced ``{...}`` substrings, outermost-first, left to right.
+
+    Scanning for individually-balanced objects lets us skip LaTeX braces
+    (``\\frac{1}{n}``) and find a real verdict object embedded in chain-of-
+    thought prose, rather than grabbing first-``{``..last-``}`` and spanning
+    the LaTeX (which never parses).
+    """
+    depth = start = 0
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0:
+                yield text[start:i + 1]
+
+
 def parse_judge_response(raw: str) -> tuple[str, str]:
     """Parse judge output into (verdict, reason).
 
-    Accepts a bare JSON object or one embedded in surrounding text.
-    Raises ValueError if it cannot be parsed or the verdict is not
-    'correct'/'incorrect'.
+    Tolerates the ways the judge model strays from "JSON only": markdown
+    fences, LaTeX ``\\boxed{...}`` wrapping, a verdict object buried in
+    chain-of-thought, and LaTeX-escaped or truncated JSON. Raises ValueError
+    if no verdict can be recovered or it is not 'correct'/'incorrect'.
     """
     text = (raw or "").strip()
+    fence = _FENCE_RE.match(text)
+    if fence:
+        text = fence.group(1).strip()
+
     data = None
+    # Prefer a real JSON object carrying a "verdict" key: the whole string, then
+    # any balanced object embedded in it (skipping LaTeX braces along the way).
+    candidates = []
     try:
-        data = json.loads(text)
+        candidates.append(json.loads(text))
     except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                data = json.loads(text[start:end + 1])
-            except json.JSONDecodeError:
-                data = None
+        pass
+    for chunk in _iter_json_objects(text):
+        try:
+            candidates.append(json.loads(chunk))
+        except json.JSONDecodeError:
+            continue
+    for obj in candidates:
+        if isinstance(obj, dict) and "verdict" in obj:
+            data = obj
+            break
+
+    # No parseable object (escaped/truncated JSON): pull the keys out by regex.
+    if data is None:
+        m = _VERDICT_RE.search(text)
+        if m:
+            data = {"verdict": m.group(1)}
+            rm = _REASON_RE.search(text)
+            if rm:
+                data["reason"] = rm.group(1)
+
     if not isinstance(data, dict) or "verdict" not in data:
         raise ValueError(f"could not parse judge response: {raw!r}")
     verdict = str(data["verdict"]).strip().lower()
@@ -224,7 +310,12 @@ def groq_chat(client: Groq, model: str, messages: list[dict]) -> tuple[str, dict
             last_exc = exc
             if attempt == MAX_RETRIES - 1:
                 break
-            time.sleep(BASE_BACKOFF * (2 ** attempt))
+            backoff = BASE_BACKOFF * (2 ** attempt)
+            logger.warning(
+                "%s attempt %d/%d failed: %s; retrying in %.1fs",
+                model, attempt + 1, MAX_RETRIES, exc, backoff,
+            )
+            time.sleep(backoff)
     raise last_exc
 
 
@@ -235,10 +326,11 @@ def ask_model(client: Groq, model: str, question: str) -> tuple[str, dict]:
 
 def judge(
     client: Groq, question: str, expected: str, answer: str
-) -> tuple[str, str, dict]:
-    """Grade an answer. Returns (verdict, reason, usage). Never raises.
+) -> tuple[str, str, str, dict]:
+    """Grade an answer. Returns (verdict, reason, raw, usage). Never raises.
 
-    usage is the judge call's {'in': int, 'out': int}; zeros on failure.
+    raw is the judge's last raw response text ("" on API error); usage is the
+    judge call's {'in': int, 'out': int}, zeros on failure.
     """
     messages = build_judge_messages(question, expected, answer)
     last_raw = ""
@@ -247,16 +339,19 @@ def judge(
         try:
             last_raw, usage = groq_chat(client, JUDGE_MODEL, messages)
         except groq.APIError as exc:
-            return "error", f"judge API error: {exc}", {"in": 0, "out": 0}
+            logger.warning("judge API error: %s", exc)
+            return "error", f"judge API error: {exc}", "", {"in": 0, "out": 0}
         try:
             verdict, reason = parse_judge_response(last_raw)
-            return verdict, reason, usage
+            return verdict, reason, last_raw, usage
         except ValueError:
             continue
-    return "error", f"unparseable judge response: {last_raw[:200]!r}", usage
+    logger.warning("unparseable judge response: %r", last_raw[:500])
+    return "error", f"unparseable judge response: {last_raw[:200]!r}", last_raw, usage
 
 
 def main() -> None:
+    setup_logging()
     load_dotenv(ENV_PATH)
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
@@ -270,29 +365,44 @@ def main() -> None:
           f"judge={JUDGE_MODEL}\n")
 
     records: list[dict] = []
+    total = len(dataset)
+    w = len(str(total))
     for model in MODELS:
         print(f"== {model} ==")
-        for row in dataset:
+        for i, row in enumerate(dataset, start=1):
             base = {
                 "model": model, "id": row["id"], "category": row["category"],
                 "question": row["question"], "expected_answer": row["expected_answer"],
             }
             zero = {"in": 0, "out": 0}
+            judge_raw = ""
+            t0 = time.perf_counter()
             try:
                 answer, m_usage = ask_model(client, model, row["question"])
-                verdict, reason, j_usage = judge(
+                verdict, reason, judge_raw, j_usage = judge(
                     client, row["question"], row["expected_answer"], answer
                 )
             except groq.APIError as exc:
                 answer, verdict, reason = "", "error", f"model API error: {exc}"
                 m_usage, j_usage = zero, zero
+                logger.warning("%s model API error on #%s: %s", model, row["id"], exc)
+            elapsed = time.perf_counter() - t0
             records.append({
                 **base, "model_answer": answer,
-                "verdict": verdict, "reason": reason,
+                "verdict": verdict, "reason": reason, "judge_raw": judge_raw,
                 "model_tokens_in": m_usage["in"], "model_tokens_out": m_usage["out"],
                 "judge_tokens_in": j_usage["in"], "judge_tokens_out": j_usage["out"],
             })
-            print(f"  [{verdict}] #{row['id']} {row['question'][:50]}")
+            logger.info(
+                "model=%s id=%s category=%s verdict=%s elapsed=%.1fs\n"
+                "QUESTION:\n%s\nMODEL_ANSWER:\n%s\nJUDGE_RAW:\n%s\n"
+                "REASON: %s\nTOKENS model=%d/%d judge=%d/%d",
+                model, row["id"], row["category"], verdict, elapsed,
+                row["question"], answer, judge_raw, reason,
+                m_usage["in"], m_usage["out"], j_usage["in"], j_usage["out"],
+            )
+            print(f"  [{i:>{w}}/{total}] #{row['id']:<3} {row['category']:<10} "
+                  f"[{verdict}] {elapsed:5.1f}s")
             time.sleep(REQUEST_DELAY)
         print()
 

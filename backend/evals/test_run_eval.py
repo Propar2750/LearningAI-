@@ -76,6 +76,42 @@ def test_parse_judge_bad_json_raises():
         run_eval.parse_judge_response("not json at all")
 
 
+def test_parse_judge_strips_markdown_fence():
+    raw = '```json\n{"verdict": "correct", "reason": "ok"}\n```'
+    assert run_eval.parse_judge_response(raw) == ("correct", "ok")
+
+
+def test_parse_judge_latex_boxed_wrapper():
+    # judge wrapped the object in \boxed{...} (observed: ids 19, 136)
+    raw = '$\\boxed{"verdict": "correct", "reason": "matches reference"}$'
+    assert run_eval.parse_judge_response(raw) == ("correct", "matches reference")
+
+
+def test_parse_judge_ignores_latex_braces_before_json():
+    # chain-of-thought full of LaTeX braces, real verdict object at the end
+    # (observed: ids 4, 23, 25, 29 - the old first-{/last-} grab spanned the
+    # LaTeX and failed to parse)
+    raw = (
+        "## Step 1: integrate $\\frac{1}{n}$ over $\\chi_{[0, 1]}$ giving "
+        "$\\sum_{s'} P(s')$.\n\n"
+        '{"verdict": "incorrect", "reason": "wrong integral"}'
+    )
+    assert run_eval.parse_judge_response(raw) == ("incorrect", "wrong integral")
+
+
+def test_parse_judge_recovers_escaped_json():
+    # LaTeX-escaped braces make json.loads fail; recover via regex (id 59 style)
+    raw = '$\\{"verdict": "incorrect", "reason": "missing format"\\}$'
+    assert run_eval.parse_judge_response(raw) == ("incorrect", "missing format")
+
+
+def test_parse_judge_recovers_verdict_from_truncated_json():
+    # response cut off mid-reason: verdict is still recoverable (id 19 style)
+    raw = '$\\boxed{"verdict": "correct", "reason": "The candidate accurately expla'
+    verdict, _ = run_eval.parse_judge_response(raw)
+    assert verdict == "correct"
+
+
 def _rec(model, verdict):
     return {"model": model, "verdict": verdict}
 
@@ -130,6 +166,42 @@ def test_write_results_roundtrip(tmp_path):
     assert read_back[0]["model"] == "A"
     assert read_back[0]["verdict"] == "correct"
     assert list(read_back[0].keys()) == run_eval.RESULT_FIELDS
+
+
+def test_write_results_includes_judge_raw(tmp_path):
+    assert "judge_raw" in run_eval.RESULT_FIELDS
+    records = [{
+        "model": "A", "id": "1", "category": "geo",
+        "question": "Capital of France?", "expected_answer": "Paris",
+        "model_answer": "Paris", "verdict": "correct", "reason": "ok",
+        "judge_raw": '{"verdict": "correct", "reason": "ok"}',
+    }]
+    out = tmp_path / "results.csv"
+    run_eval.write_results(records, str(out))
+    with open(out, newline="", encoding="utf-8") as f:
+        read_back = list(csv.DictReader(f))
+    assert read_back[0]["judge_raw"] == '{"verdict": "correct", "reason": "ok"}'
+
+
+def test_setup_logging_is_file_only_and_idempotent(tmp_path, monkeypatch):
+    import logging
+    from logging.handlers import RotatingFileHandler
+
+    monkeypatch.setattr(run_eval, "LOG_PATH", tmp_path / "eval.log")
+    run_eval.logger.handlers.clear()
+    try:
+        run_eval.setup_logging()
+        run_eval.setup_logging()  # second call must not add a duplicate handler
+        file_handlers = [
+            h for h in run_eval.logger.handlers
+            if isinstance(h, RotatingFileHandler)
+        ]
+        assert len(file_handlers) == 1
+        assert run_eval.logger.propagate is False
+    finally:
+        for h in run_eval.logger.handlers:
+            h.close()
+        run_eval.logger.handlers.clear()
 
 
 from types import SimpleNamespace
