@@ -45,6 +45,8 @@ CATEGORY_COL = "Topic"
 RESULT_FIELDS = [
     "model", "id", "category", "question",
     "expected_answer", "model_answer", "verdict", "reason",
+    "model_tokens_in", "model_tokens_out",
+    "judge_tokens_in", "judge_tokens_out",
 ]
 
 
@@ -133,6 +135,23 @@ def summarize(records: list[dict]) -> list[dict]:
     return summary
 
 
+def token_totals(records: list[dict]) -> list[dict]:
+    """Sum model and judge token usage per model, in first-seen order."""
+    order: list[str] = []
+    totals: dict[str, dict] = {}
+    for r in records:
+        m = r["model"]
+        if m not in totals:
+            order.append(m)
+            totals[m] = {"model_in": 0, "model_out": 0,
+                         "judge_in": 0, "judge_out": 0}
+        totals[m]["model_in"] += int(r.get("model_tokens_in") or 0)
+        totals[m]["model_out"] += int(r.get("model_tokens_out") or 0)
+        totals[m]["judge_in"] += int(r.get("judge_tokens_in") or 0)
+        totals[m]["judge_out"] += int(r.get("judge_tokens_out") or 0)
+    return [{"model": m, **totals[m]} for m in order]
+
+
 def format_table(summary: list[dict]) -> str:
     """Render the per-model accuracy table as a string."""
     header = f"{'Model':<32}{'Correct':>9}{'Incorrect':>11}{'Errors':>8}{'Accuracy':>11}"
@@ -178,15 +197,29 @@ def build_judge_messages(question: str, expected: str, answer: str) -> list[dict
     ]
 
 
-def groq_chat(client: Groq, model: str, messages: list[dict]) -> str:
-    """Call Groq chat completions with retry/backoff on API errors."""
+def usage_from_response(resp) -> dict:
+    """Extract token usage from a Groq chat response as {'in': int, 'out': int}."""
+    u = getattr(resp, "usage", None)
+    if u is None:
+        return {"in": 0, "out": 0}
+    return {
+        "in": int(getattr(u, "prompt_tokens", 0) or 0),
+        "out": int(getattr(u, "completion_tokens", 0) or 0),
+    }
+
+
+def groq_chat(client: Groq, model: str, messages: list[dict]) -> tuple[str, dict]:
+    """Call Groq chat completions with retry/backoff on API errors.
+
+    Returns (content, usage) where usage is {'in': int, 'out': int}.
+    """
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
             resp = client.chat.completions.create(
                 model=model, messages=messages, temperature=0,
             )
-            return resp.choices[0].message.content or ""
+            return (resp.choices[0].message.content or ""), usage_from_response(resp)
         except groq.APIError as exc:  # base class for rate-limit/status/conn errors
             last_exc = exc
             if attempt == MAX_RETRIES - 1:
@@ -195,24 +228,32 @@ def groq_chat(client: Groq, model: str, messages: list[dict]) -> str:
     raise last_exc
 
 
-def ask_model(client: Groq, model: str, question: str) -> str:
+def ask_model(client: Groq, model: str, question: str) -> tuple[str, dict]:
+    """Return (answer, usage) for the model's reply to a bare question."""
     return groq_chat(client, model, [{"role": "user", "content": question}])
 
 
-def judge(client: Groq, question: str, expected: str, answer: str) -> tuple[str, str]:
-    """Grade an answer. Never raises: returns ('error', detail) on failure."""
+def judge(
+    client: Groq, question: str, expected: str, answer: str
+) -> tuple[str, str, dict]:
+    """Grade an answer. Returns (verdict, reason, usage). Never raises.
+
+    usage is the judge call's {'in': int, 'out': int}; zeros on failure.
+    """
     messages = build_judge_messages(question, expected, answer)
     last_raw = ""
+    usage = {"in": 0, "out": 0}
     for _ in range(2):  # one retry on unparseable JSON
         try:
-            last_raw = groq_chat(client, JUDGE_MODEL, messages)
+            last_raw, usage = groq_chat(client, JUDGE_MODEL, messages)
         except groq.APIError as exc:
-            return "error", f"judge API error: {exc}"
+            return "error", f"judge API error: {exc}", {"in": 0, "out": 0}
         try:
-            return parse_judge_response(last_raw)
+            verdict, reason = parse_judge_response(last_raw)
+            return verdict, reason, usage
         except ValueError:
             continue
-    return "error", f"unparseable judge response: {last_raw[:200]!r}"
+    return "error", f"unparseable judge response: {last_raw[:200]!r}", usage
 
 
 def main() -> None:
@@ -236,15 +277,21 @@ def main() -> None:
                 "model": model, "id": row["id"], "category": row["category"],
                 "question": row["question"], "expected_answer": row["expected_answer"],
             }
+            zero = {"in": 0, "out": 0}
             try:
-                answer = ask_model(client, model, row["question"])
-                verdict, reason = judge(
+                answer, m_usage = ask_model(client, model, row["question"])
+                verdict, reason, j_usage = judge(
                     client, row["question"], row["expected_answer"], answer
                 )
             except groq.APIError as exc:
                 answer, verdict, reason = "", "error", f"model API error: {exc}"
-            records.append({**base, "model_answer": answer,
-                            "verdict": verdict, "reason": reason})
+                m_usage, j_usage = zero, zero
+            records.append({
+                **base, "model_answer": answer,
+                "verdict": verdict, "reason": reason,
+                "model_tokens_in": m_usage["in"], "model_tokens_out": m_usage["out"],
+                "judge_tokens_in": j_usage["in"], "judge_tokens_out": j_usage["out"],
+            })
             print(f"  [{verdict}] #{row['id']} {row['question'][:50]}")
             time.sleep(REQUEST_DELAY)
         print()
@@ -255,6 +302,10 @@ def main() -> None:
     write_results(records, str(out_path))
 
     print(format_table(summarize(records)))
+    print("\nToken usage per model (in/out):")
+    for t in token_totals(records):
+        print(f"  {t['model']:<42} answer={t['model_in']}/{t['model_out']}  "
+              f"judge={t['judge_in']}/{t['judge_out']}")
     print(f"\nDetailed results written to {out_path}")
 
 

@@ -130,3 +130,31 @@ def test_write_results_roundtrip(tmp_path):
     assert read_back[0]["model"] == "A"
     assert read_back[0]["verdict"] == "correct"
     assert list(read_back[0].keys()) == run_eval.RESULT_FIELDS
+
+
+from types import SimpleNamespace
+
+
+def test_usage_from_response_reads_tokens():
+    resp = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=42, completion_tokens=7))
+    assert run_eval.usage_from_response(resp) == {"in": 42, "out": 7}
+
+
+def test_usage_from_response_handles_missing_usage():
+    resp = SimpleNamespace(usage=None)
+    assert run_eval.usage_from_response(resp) == {"in": 0, "out": 0}
+
+
+def test_token_totals_sums_per_model_in_order():
+    records = [
+        {"model": "Z", "model_tokens_in": 10, "model_tokens_out": 5,
+         "judge_tokens_in": 3, "judge_tokens_out": 1},
+        {"model": "Z", "model_tokens_in": 20, "model_tokens_out": 8,
+         "judge_tokens_in": 4, "judge_tokens_out": 2},
+        {"model": "A", "model_tokens_in": 1, "model_tokens_out": 1,
+         "judge_tokens_in": 1, "judge_tokens_out": 1},
+    ]
+    totals = run_eval.token_totals(records)
+    assert [t["model"] for t in totals] == ["Z", "A"]
+    assert totals[0] == {"model": "Z", "model_in": 30, "model_out": 13,
+                         "judge_in": 7, "judge_out": 3}
