@@ -124,3 +124,25 @@ def summarize(records: list[dict]) -> list[dict]:
         accuracy = round(100.0 * s["correct"] / graded, 1) if graded else None
         summary.append({"model": m, **s, "accuracy": accuracy})
     return summary
+
+
+def format_table(summary: list[dict]) -> str:
+    """Render the per-model accuracy table as a string."""
+    header = f"{'Model':<32}{'Correct':>9}{'Incorrect':>11}{'Errors':>8}{'Accuracy':>11}"
+    lines = [header, "-" * len(header)]
+    for s in summary:
+        acc = "n/a" if s["accuracy"] is None else f"{s['accuracy']}%"
+        lines.append(
+            f"{s['model']:<32}{s['correct']:>9}{s['incorrect']:>11}"
+            f"{s['errors']:>8}{acc:>11}"
+        )
+    return "\n".join(lines)
+
+
+def write_results(records: list[dict], path: str) -> None:
+    """Write one row per model x question to a CSV with RESULT_FIELDS columns."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=RESULT_FIELDS)
+        writer.writeheader()
+        for r in records:
+            writer.writerow({k: r.get(k, "") for k in RESULT_FIELDS})

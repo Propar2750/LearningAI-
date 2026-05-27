@@ -105,3 +105,28 @@ def test_summarize_all_errors_is_na():
 def test_summarize_preserves_first_seen_order():
     records = [_rec("Z", "correct"), _rec("A", "correct")]
     assert [r["model"] for r in run_eval.summarize(records)] == ["Z", "A"]
+
+
+def test_format_table_contains_models_and_pct():
+    summary = [
+        {"model": "A", "correct": 2, "incorrect": 1, "errors": 0, "accuracy": 66.7},
+        {"model": "B", "correct": 0, "incorrect": 0, "errors": 2, "accuracy": None},
+    ]
+    out = run_eval.format_table(summary)
+    assert "A" in out and "66.7%" in out
+    assert "B" in out and "n/a" in out
+
+
+def test_write_results_roundtrip(tmp_path):
+    records = [{
+        "model": "A", "id": "1", "category": "geo",
+        "question": "Capital of France?", "expected_answer": "Paris",
+        "model_answer": "Paris", "verdict": "correct", "reason": "ok",
+    }]
+    out = tmp_path / "results.csv"
+    run_eval.write_results(records, str(out))
+    with open(out, newline="", encoding="utf-8") as f:
+        read_back = list(csv.DictReader(f))
+    assert read_back[0]["model"] == "A"
+    assert read_back[0]["verdict"] == "correct"
+    assert list(read_back[0].keys()) == run_eval.RESULT_FIELDS
