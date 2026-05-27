@@ -1,0 +1,12 @@
+{
+  "_comment": "USD per 1,000,000 tokens for the model under test (judge cost is not counted). Edit to match current Groq pricing; figures here are illustrative defaults.",
+  "default": { "in": 0.0, "out": 0.0 },
+  "models": {
+    "meta-llama/llama-4-scout-17b-16e-instruct": { "in": 0.11, "out": 0.34 },
+    "llama-3.1-8b-instant":                       { "in": 0.05, "out": 0.08 },
+    "llama-3.3-70b-versatile":                    { "in": 0.59, "out": 0.79 },
+    "openai/gpt-oss-120b":                        { "in": 0.15, "out": 0.75 },
+    "openai/gpt-oss-20b":                         { "in": 0.10, "out": 0.50 },
+    "qwen/qwen3-32b":                             { "in": 0.29, "out": 0.59 }
+  }
+}
