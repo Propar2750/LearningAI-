@@ -4,8 +4,11 @@ build/
 .env
 .env.local
 *.log
+*.log.*
 .DS_Store
 __pycache__/
 *.pyc
 .vite/
 backend/evals/results/*.csv
+# Generated eval charts (regenerable via analyze_results.py)
+backend/evals/results/analysis/
