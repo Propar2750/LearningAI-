@@ -74,3 +74,34 @@ def test_parse_judge_invalid_verdict_raises():
 def test_parse_judge_bad_json_raises():
     with pytest.raises(ValueError):
         run_eval.parse_judge_response("not json at all")
+
+
+def _rec(model, verdict):
+    return {"model": model, "verdict": verdict}
+
+
+def test_summarize_basic_accuracy():
+    records = [
+        _rec("A", "correct"), _rec("A", "correct"),
+        _rec("A", "incorrect"), _rec("A", "error"),
+    ]
+    summary = run_eval.summarize(records)
+    row = summary[0]
+    assert row["model"] == "A"
+    assert row["correct"] == 2
+    assert row["incorrect"] == 1
+    assert row["errors"] == 1
+    # accuracy excludes errors: 2 / (2 + 1)
+    assert row["accuracy"] == pytest.approx(66.7, abs=0.05)
+
+
+def test_summarize_all_errors_is_na():
+    records = [_rec("B", "error"), _rec("B", "error")]
+    row = run_eval.summarize(records)[0]
+    assert row["correct"] == 0 and row["incorrect"] == 0 and row["errors"] == 2
+    assert row["accuracy"] is None  # rendered as "n/a"
+
+
+def test_summarize_preserves_first_seen_order():
+    records = [_rec("Z", "correct"), _rec("A", "correct")]
+    assert [r["model"] for r in run_eval.summarize(records)] == ["Z", "A"]

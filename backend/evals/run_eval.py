@@ -95,3 +95,32 @@ def parse_judge_response(raw: str) -> tuple[str, str]:
         raise ValueError(f"unexpected verdict {verdict!r} in: {raw!r}")
     reason = str(data.get("reason", "")).strip()
     return verdict, reason
+
+
+def summarize(records: list[dict]) -> list[dict]:
+    """Aggregate per model in first-seen order.
+
+    accuracy = correct / (correct + incorrect) * 100, or None if that
+    denominator is 0 (rendered as 'n/a').
+    """
+    order: list[str] = []
+    stats: dict[str, dict] = {}
+    for r in records:
+        m = r["model"]
+        if m not in stats:
+            order.append(m)
+            stats[m] = {"correct": 0, "incorrect": 0, "errors": 0}
+        v = r["verdict"]
+        if v == "correct":
+            stats[m]["correct"] += 1
+        elif v == "incorrect":
+            stats[m]["incorrect"] += 1
+        else:
+            stats[m]["errors"] += 1
+    summary = []
+    for m in order:
+        s = stats[m]
+        graded = s["correct"] + s["incorrect"]
+        accuracy = round(100.0 * s["correct"] / graded, 1) if graded else None
+        summary.append({"model": m, **s, "accuracy": accuracy})
+    return summary
